@@ -63,7 +63,10 @@ Ubuntu
 Note: this list is (obviously) incomplete. We intend to complete it as we 
 have more information and install additional systems.
 
-sudo apt-get install libdbi-dev
+sudo apt-get install libdbi-dev libmysqlclient-dev postgresql-client
+
+for KSI, from the Adiscon PPA:
+sudo apt-get install libksi0 libksi-devel
 
 
 openSUSE 13

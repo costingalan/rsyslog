@@ -71,7 +71,7 @@
 /* TODO: move the global variable root to the config object - had no time to to it
  * right now before vacation -- rgerhards, 2013-07-22
  */
-static pthread_rwlock_t glblVars_rwlock;
+static pthread_mutex_t glblVars_lock;
 struct json_object *global_var_root = NULL;
 
 /* static data */
@@ -787,7 +787,9 @@ static inline rsRetVal msgBaseConstruct(msg_t **ppThis)
 	pM->rcvFrom.pRcvFrom = NULL;
 	pM->pRuleset = NULL;
 	pM->json = NULL;
+	pthread_mutex_init(&pM->mut_json, NULL);
 	pM->localvars = NULL;
+	pthread_mutex_init(&pM->mut_localvars, NULL);
 	pM->dfltTZ[0] = '\0';
 	memset(&pM->tRcvdAt, 0, sizeof(pM->tRcvdAt));
 	memset(&pM->tTIMESTAMP, 0, sizeof(pM->tTIMESTAMP));
@@ -933,8 +935,10 @@ CODESTARTobjDestruct(msg)
 			rsCStrDestruct(&pThis->pCSMSGID);
 		if(pThis->json != NULL)
 			json_object_put(pThis->json);
+		pthread_mutex_destroy(&pThis->mut_json);
 		if(pThis->localvars != NULL)
 			json_object_put(pThis->localvars);
+		pthread_mutex_destroy(&pThis->mut_localvars);
 		if(pThis->pszUUID != NULL)
 			free(pThis->pszUUID);
 #	ifndef HAVE_ATOMIC_BUILTINS
@@ -1580,8 +1584,23 @@ getRawMsgAfterPRI(msg_t * const pM, uchar **pBuf, int *piLen)
 			*pBuf=  UCHAR_CONSTANT("");
 			*piLen = 0;
 		} else {
-			*pBuf = pM->pszRawMsg + pM->offAfterPRI;
-			*piLen = pM->iLenRawMsg - pM->offAfterPRI;
+			/* unfortunately, pM->offAfterPRI seems NOT to be
+			 * correct/consistent in all cases. imuxsock and imudp
+			 * seem to have other values than imptcp. Testbench
+			 * covers some of that. As a work-around, we caluculate
+			 * the value ourselfes here. -- rgerhards, 2015-10-09
+			 */
+			size_t offAfterPRI = 0;
+			if(pM->pszRawMsg[0] == '<') { /* do we have a PRI? */
+				if(pM->pszRawMsg[2] == '>')
+					offAfterPRI = 3;
+				else if(pM->pszRawMsg[3] == '>')
+					offAfterPRI = 4;
+				else if(pM->pszRawMsg[4] == '>')
+					offAfterPRI = 5;
+			}
+			*pBuf = pM->pszRawMsg + offAfterPRI;
+			*piLen = pM->iLenRawMsg - offAfterPRI;
 		}
 	}
 }
@@ -2705,15 +2724,19 @@ void MsgSetRawMsgWOSize(msg_t * const pMsg, char* pszRawMsg)
  * The variable pRes must point to a user-supplied buffer of
  * at least 20 characters.
  */
-static void
-textpri(const msg_t *const __restrict__ pMsg, uchar *const __restrict__ pRes)
+static uchar *
+textpri(const msg_t *const __restrict__ pMsg)
 {
-	assert(pRes != NULL);
-	memcpy(pRes, syslog_fac_names[pMsg->iFacility], len_syslog_fac_names[pMsg->iFacility]);
-	pRes[len_syslog_fac_names[pMsg->iFacility]] = '.';
-	memcpy(pRes+len_syslog_fac_names[pMsg->iFacility]+1,
-	       syslog_severity_names[pMsg->iSeverity],
-	       len_syslog_severity_names[pMsg->iSeverity]+1 /* for \0! */);
+	int lenfac = len_syslog_fac_names[pMsg->iFacility];
+	int lensev = len_syslog_severity_names[pMsg->iSeverity];
+	int totlen = lenfac + 1 + lensev + 1;
+	char *pRes = MALLOC(totlen);
+	if(pRes != NULL) {
+		memcpy(pRes, syslog_fac_names[pMsg->iFacility], lenfac);
+		pRes[lenfac] = '.';
+		memcpy(pRes+lenfac+1, syslog_severity_names[pMsg->iSeverity], lensev+1 /* for \0! */);
+	}
+	return pRes;
 }
 
 
@@ -2731,7 +2754,7 @@ static uchar *getNOW(eNOWType eNow, struct syslogTime *t)
 	uchar *pBuf;
 	struct syslogTime tt;
 
-	if((pBuf = (uchar*) MALLOC(sizeof(uchar) * tmpBUFSIZE)) == NULL) {
+	if((pBuf = (uchar*) MALLOC(tmpBUFSIZE)) == NULL) {
 		return NULL;
 	}
 
@@ -2790,6 +2813,7 @@ getJSONPropVal(msg_t * const pMsg, msgPropDescr_t *pProp, uchar **pRes, rs_size_
 	struct json_object *jroot;
 	struct json_object *parent;
 	struct json_object *field;
+	pthread_mutex_t *mut = NULL;
 	DEFiRet;
 
 	if(*pbMustBeFreed)
@@ -2798,16 +2822,21 @@ getJSONPropVal(msg_t * const pMsg, msgPropDescr_t *pProp, uchar **pRes, rs_size_
 
 	if(pProp->id == PROP_CEE) {
 		jroot = pMsg->json;
+		mut = &pMsg->mut_json;
 	} else if(pProp->id == PROP_LOCAL_VAR) {
 		jroot = pMsg->localvars;
+		mut = &pMsg->mut_localvars;
 	} else if(pProp->id == PROP_GLOBAL_VAR) {
-		pthread_rwlock_rdlock(&glblVars_rwlock);
+		mut = &glblVars_lock;
 		jroot = global_var_root;
 	} else {
 		DBGPRINTF("msgGetJSONPropVal; invalid property id %d\n",
 			  pProp->id);
 		ABORT_FINALIZE(RS_RET_NOT_FOUND);
 	}
+	if(mut != NULL)
+		pthread_mutex_lock(mut);
+
 	if(jroot == NULL) goto finalize_it;
 
 	if(!strcmp((char*)pProp->name, "!")) {
@@ -2825,8 +2854,8 @@ getJSONPropVal(msg_t * const pMsg, msgPropDescr_t *pProp, uchar **pRes, rs_size_
 	}
 
 finalize_it:
-	if(pProp->id == PROP_GLOBAL_VAR)
-		pthread_rwlock_unlock(&glblVars_rwlock);
+	if(mut != NULL)
+		pthread_mutex_unlock(mut);
 	if(*pRes == NULL) {
 		/* could not find any value, so set it to empty */
 		*pRes = (unsigned char*)"";
@@ -2836,6 +2865,77 @@ finalize_it:
 }
 
 
+/* Get a JSON-based-variable as native json object, except
+ * when it is string type, in which case a string is returned.
+ * This is an optimization to not use JSON when not strictly
+ * necessary. This in turn is helpful, as calling json-c is
+ * *very* expensive due to our need for locking and deep
+ * copies.
+ * The caller needs to check pjson and pcstr: one of them
+ * is non-NULL and contains the return value. Note that
+ * the caller is responsible for freeing the string pointer
+ * it if is being returned.
+ */
+rsRetVal
+msgGetJSONPropJSONorString(msg_t * const pMsg, msgPropDescr_t *pProp, struct json_object **pjson,
+	uchar **pcstr)
+{
+	struct json_object *jroot;
+	uchar *leaf;
+	struct json_object *parent;
+	pthread_mutex_t *mut = NULL;
+	DEFiRet;
+
+	*pjson = NULL, *pcstr = NULL;
+
+	if(pProp->id == PROP_CEE) {
+		jroot = pMsg->json;
+		mut = &pMsg->mut_json;
+	} else if(pProp->id == PROP_LOCAL_VAR) {
+		jroot = pMsg->localvars;
+		mut = &pMsg->mut_json;
+	} else if(pProp->id == PROP_GLOBAL_VAR) {
+		mut = &glblVars_lock;
+		jroot = global_var_root;
+	} else {
+		DBGPRINTF("msgGetJSONPropJSON; invalid property id %d\n",
+			  pProp->id);
+		ABORT_FINALIZE(RS_RET_NOT_FOUND);
+	}
+	if(mut != NULL)
+		pthread_mutex_lock(mut);
+
+	if(!strcmp((char*)pProp->name, "!")) {
+		*pjson = jroot;
+		FINALIZE;
+	}
+	leaf = jsonPathGetLeaf(pProp->name, pProp->nameLen);
+	CHKiRet(jsonPathFindParent(jroot, pProp->name, leaf, &parent, 1));
+	if(jsonVarExtract(parent, (char*)leaf, pjson) == FALSE) {
+		ABORT_FINALIZE(RS_RET_NOT_FOUND);
+	}
+	if(*pjson == NULL) {
+		/* we had a NULL json object and represent this as empty string */
+		*pcstr = (uchar*) strdup("");
+	} else {
+		if(json_object_get_type(*pjson) == json_type_string) {
+			*pcstr = (uchar*) strdup(json_object_get_string(*pjson));
+			*pjson = NULL;
+		}
+	}
+
+finalize_it:
+	/* we need a deep copy, as another thread may modify the object */
+	if(*pjson != NULL)
+		*pjson = jsonDeepCopy(*pjson);
+	if(mut != NULL)
+		pthread_mutex_unlock(mut);
+dbgprintf("JSONorString: pjson %p, pcstr %p\n", *pjson, *pcstr);
+	RETiRet;
+}
+
+
+
 /* Get a JSON-based-variable as native json object */
 rsRetVal
 msgGetJSONPropJSON(msg_t * const pMsg, msgPropDescr_t *pProp, struct json_object **pjson)
@@ -2843,27 +2943,27 @@ msgGetJSONPropJSON(msg_t * const pMsg, msgPropDescr_t *pProp, struct json_object
 	struct json_object *jroot;
 	uchar *leaf;
 	struct json_object *parent;
+	pthread_mutex_t *mut = NULL;
 	DEFiRet;
 
 	*pjson = NULL;
 
 	if(pProp->id == PROP_CEE) {
 		jroot = pMsg->json;
+		mut = &pMsg->mut_json;
 	} else if(pProp->id == PROP_LOCAL_VAR) {
 		jroot = pMsg->localvars;
+		mut = &pMsg->mut_json;
 	} else if(pProp->id == PROP_GLOBAL_VAR) {
-		pthread_rwlock_rdlock(&glblVars_rwlock);
+		mut = &glblVars_lock;
 		jroot = global_var_root;
 	} else {
 		DBGPRINTF("msgGetJSONPropJSON; invalid property id %d\n",
 			  pProp->id);
 		ABORT_FINALIZE(RS_RET_NOT_FOUND);
 	}
-	if(jroot == NULL) {
-		DBGPRINTF("msgGetJSONPropJSON; jroot empty for property %s\n",
-			  pProp->name);
-		ABORT_FINALIZE(RS_RET_NOT_FOUND);
-	}
+	if(mut != NULL)
+		pthread_mutex_lock(mut);
 
 	if(!strcmp((char*)pProp->name, "!")) {
 		*pjson = jroot;
@@ -2876,14 +2976,11 @@ msgGetJSONPropJSON(msg_t * const pMsg, msgPropDescr_t *pProp, struct json_object
 	}
 
 finalize_it:
-	if(pProp->id == PROP_GLOBAL_VAR) {
-		if (*pjson != NULL)
-			*pjson = jsonDeepCopy(*pjson);
-		pthread_rwlock_unlock(&glblVars_rwlock);
-	} else {
-		if (*pjson != NULL)
-			json_object_get(*pjson);
-	}
+	/* we need a deep copy, as another thread may modify the object */
+	if(*pjson != NULL)
+		*pjson = jsonDeepCopy(*pjson);
+	if(mut != NULL)
+		pthread_mutex_unlock(mut);
 	RETiRet;
 }
 
@@ -3170,10 +3267,10 @@ uchar *MsgGetProp(msg_t *__restrict__ const pMsg, struct templateEntry *__restri
 			pRes = (uchar*)getPRI(pMsg);
 			break;
 		case PROP_PRI_TEXT:
-			if((pRes = MALLOC(20 * sizeof(uchar))) == NULL)
+			pRes = textpri(pMsg);
+			if(pRes == NULL)
 				RET_OUT_OF_MEMORY;
 			*pbMustBeFreed = 1;
-			textpri(pMsg, pRes);
 			break;
 		case PROP_IUT:
 			pRes = UCHAR_CONSTANT("1"); /* always 1 for syslog messages (a MonitorWare thing;)) */
@@ -3302,13 +3399,13 @@ uchar *MsgGetProp(msg_t *__restrict__ const pMsg, struct templateEntry *__restri
 				bufLen = 2;
 				*pbMustBeFreed = 0;
 			} else {
-				MsgLock(pMsg);
+				pthread_mutex_lock(&pMsg->mut_json);
 				if(pProp->id == PROP_CEE_ALL_JSON) {
 					pRes = (uchar*)strdup(RS_json_object_to_json_string_ext(pMsg->json, JSON_C_TO_STRING_SPACED));
 				} else if(pProp->id == PROP_CEE_ALL_JSON_PLAIN) {
 					pRes = (uchar*)strdup(RS_json_object_to_json_string_ext(pMsg->json, JSON_C_TO_STRING_PLAIN));
 				}
-				MsgUnlock(pMsg);
+				pthread_mutex_unlock(&pMsg->mut_json);
 				*pbMustBeFreed = 1;
 			}
 			break;
@@ -3334,7 +3431,7 @@ uchar *MsgGetProp(msg_t *__restrict__ const pMsg, struct templateEntry *__restri
 			{
 			struct timespec tp;
 
-			if((pRes = (uchar*) MALLOC(sizeof(uchar) * 32)) == NULL) {
+			if((pRes = (uchar*) MALLOC(32)) == NULL) {
 				RET_OUT_OF_MEMORY;
 			}
  
@@ -3346,7 +3443,7 @@ uchar *MsgGetProp(msg_t *__restrict__ const pMsg, struct templateEntry *__restri
  
 			*pbMustBeFreed = 1;
 
-			snprintf((char*) pRes, sizeof(uchar) * 32, "%ld", tp.tv_sec);
+			snprintf((char*) pRes, 32, "%ld", tp.tv_sec);
  			}
 
 #			else
@@ -3354,7 +3451,7 @@ uchar *MsgGetProp(msg_t *__restrict__ const pMsg, struct templateEntry *__restri
 			{
 			struct sysinfo s_info;
 
-			if((pRes = (uchar*) MALLOC(sizeof(uchar) * 32)) == NULL) {
+			if((pRes = (uchar*) MALLOC(32)) == NULL) {
 				RET_OUT_OF_MEMORY;
 			}
 
@@ -3366,7 +3463,7 @@ uchar *MsgGetProp(msg_t *__restrict__ const pMsg, struct templateEntry *__restri
 
 			*pbMustBeFreed = 1;
 
-			snprintf((char*) pRes, sizeof(uchar) * 32, "%ld", s_info.uptime);
+			snprintf((char*) pRes, 32, "%ld", s_info.uptime);
 			}
 #			endif
 		break;
@@ -3433,7 +3530,7 @@ uchar *MsgGetProp(msg_t *__restrict__ const pMsg, struct templateEntry *__restri
 			/* we got our end pointer, now do the copy */
 			/* TODO: code copied from below, this is a candidate for a separate function */
 			iLen = pFldEnd - pFld + 1; /* the +1 is for an actual char, NOT \0! */
-			pBufStart = pBuf = MALLOC((iLen + 1) * sizeof(uchar));
+			pBufStart = pBuf = MALLOC(iLen + 1);
 			if(pBuf == NULL) {
 				if(*pbMustBeFreed == 1)
 					free(pRes);
@@ -3545,7 +3642,7 @@ uchar *MsgGetProp(msg_t *__restrict__ const pMsg, struct templateEntry *__restri
 
 					iLenBuf = pmatch[pTpe->data.field.iSubMatchToUse].rm_eo
 						  - pmatch[pTpe->data.field.iSubMatchToUse].rm_so;
-					pB = MALLOC((iLenBuf + 1) * sizeof(uchar));
+					pB = MALLOC(iLenBuf + 1);
 
 					if (pB == NULL) {
 						if (*pbMustBeFreed == 1)
@@ -3606,12 +3703,12 @@ uchar *MsgGetProp(msg_t *__restrict__ const pMsg, struct templateEntry *__restri
 			 */
 			; /*DO NOTHING*/
 		} else {
-			if(iTo > bufLen)  /* iTo is very large, if no to-position is set in the template! */
+			if(iTo >= bufLen)  /* iTo is very large, if no to-position is set in the template! */
 				if (pTpe->data.field.options.bFixedWidth == 0)
-					iTo = bufLen;
+					iTo = bufLen - 1;
 
 			iLen = iTo - iFrom + 1; /* the +1 is for an actual char, NOT \0! */
-			pBufStart = pBuf = MALLOC((iLen + 1) * sizeof(uchar));
+			pBufStart = pBuf = MALLOC(iLen + 1);
 			if(pBuf == NULL) {
 				if(*pbMustBeFreed == 1)
 					free(pRes);
@@ -3669,7 +3766,7 @@ uchar *MsgGetProp(msg_t *__restrict__ const pMsg, struct templateEntry *__restri
 			uchar *pBStart;
 			uchar *pB;
 			uchar *pSrc;
-			pBStart = pB = MALLOC((bufLen + 1) * sizeof(uchar));
+			pBStart = pB = MALLOC(bufLen + 1);
 			if(pB == NULL) {
 				if(*pbMustBeFreed == 1)
 					free(pRes);
@@ -3790,7 +3887,7 @@ uchar *MsgGetProp(msg_t *__restrict__ const pMsg, struct templateEntry *__restri
 				int i;
 
 				iLenBuf += iNumCC * 4;
-				pBStart = pB = MALLOC((iLenBuf + 1) * sizeof(uchar));
+				pBStart = pB = MALLOC(iLenBuf + 1);
 				if(pB == NULL) {
 					if(*pbMustBeFreed == 1)
 						free(pRes);
@@ -3925,7 +4022,7 @@ uchar *MsgGetProp(msg_t *__restrict__ const pMsg, struct templateEntry *__restri
 			/* check if we need to obtain a private copy */
 			if(*pbMustBeFreed == 0) {
 				/* ok, original copy, need a private one */
-				pB = MALLOC((iLn + 1) * sizeof(uchar));
+				pB = MALLOC(iLn + 1);
 				if(pB == NULL) {
 					RET_OUT_OF_MEMORY;
 				}
@@ -3953,7 +4050,7 @@ uchar *MsgGetProp(msg_t *__restrict__ const pMsg, struct templateEntry *__restri
 			bufLen = ustrlen(pRes);
 		iBufLen = bufLen;
 		/* the malloc may be optimized, we currently use the worst case... */
-		pBStart = pDst = MALLOC((2 * iBufLen + 3) * sizeof(uchar));
+		pBStart = pDst = MALLOC(2 * iBufLen + 3);
 		if(pDst == NULL) {
 			if(*pbMustBeFreed == 1)
 				free(pRes);
@@ -4001,9 +4098,6 @@ msgSetPropViaJSON(msg_t *__restrict__ const pMsg, const char *name, struct json_
 	prop_t *propRcvFromIP = NULL;
 	DEFiRet;
 
-	// TODO: think if we need to lock the message mutex. For some updates
-	// we probably need to!
-	
 	/* note: json_object_get_string() manages the memory of the returned
 	 *       string. So we MUST NOT free it!
 	 */
@@ -4224,6 +4318,9 @@ jsonPathFindParent(struct json_object *jroot, uchar *name, uchar *leaf, struct j
 	while(name < leaf-1) {
 		jsonPathFindNext(*parent, namestart, &name, leaf, parent, bCreate);
 	}
+	if(*parent == NULL)
+		ABORT_FINALIZE(RS_RET_NOT_FOUND);
+finalize_it:
 	RETiRet;
 }
 
@@ -4282,16 +4379,18 @@ msgAddJSON(msg_t * const pM, uchar *name, struct json_object *json, int force_re
 	struct json_object *parent, *leafnode;
 	struct json_object *given = NULL;
 	uchar *leaf;
+	pthread_mutex_t *mut = NULL;
 	DEFiRet;
 
-	MsgLock(pM);
 	if(name[0] == '!') {
 		pjroot = &pM->json;
+		mut = &pM->mut_json;
 	} else if(name[0] == '.') {
 		pjroot = &pM->localvars;
+		mut = &pM->mut_localvars;
 	} else if (name[0] == '/') { /* globl var */
-		pthread_rwlock_wrlock(&glblVars_rwlock);
 		pjroot = &global_var_root;
+		mut = &glblVars_lock;
 		if (sharedReference) {
 			given = json;
 			json = jsonDeepCopy(json);
@@ -4301,6 +4400,7 @@ msgAddJSON(msg_t * const pM, uchar *name, struct json_object *json, int force_re
 		DBGPRINTF("Passed name %s is unknown kind of variable (It is not CEE, Local or Global variable).", name);
 		ABORT_FINALIZE(RS_RET_INVLD_SETOP);
 	}
+	pthread_mutex_lock(mut);
 
 	if(name[1] == '\0') { /* full tree? */
 		if(*pjroot == NULL)
@@ -4351,9 +4451,8 @@ msgAddJSON(msg_t * const pM, uchar *name, struct json_object *json, int force_re
 	}
 
 finalize_it:
-	if(name[0] == '/')
-		pthread_rwlock_unlock(&glblVars_rwlock);
-	MsgUnlock(pM);
+	if(mut != NULL)
+		pthread_mutex_unlock(mut);
 	RETiRet;
 }
 
@@ -4364,22 +4463,26 @@ msgDelJSON(msg_t * const pM, uchar *name)
 	struct json_object **jroot;
 	struct json_object *parent, *leafnode;
 	uchar *leaf;
+	pthread_mutex_t *mut = NULL;
 	DEFiRet;
-
-	MsgLock(pM);
 
 	if(name[0] == '!') {
 		jroot = &pM->json;
+		mut = &pM->mut_json;
 	} else if(name[0] == '.') {
 		jroot = &pM->localvars;
+		mut = &pM->mut_localvars;
 	} else if (name[0] == '/') { /* globl var */
-		pthread_rwlock_wrlock(&glblVars_rwlock);
 		jroot = &global_var_root;
+		mut = &glblVars_lock;
 	} else {
-		DBGPRINTF("Passed name %s is unknown kind of variable (It is not CEE, Local or Global variable).", name);
+		DBGPRINTF("Passed name %s is unknown kind of variable (It is not CEE, "
+			  "Local or Global variable).", name);
 		ABORT_FINALIZE(RS_RET_INVLD_SETOP);
 	}
-	if(jroot == NULL) {
+	pthread_mutex_lock(mut);
+
+	if(*jroot == NULL) {
 		DBGPRINTF("msgDelJSONVar; jroot empty in unset for property %s\n",
 			  name);
 		FINALIZE;
@@ -4393,10 +4496,6 @@ msgDelJSON(msg_t * const pM, uchar *name)
 		json_object_put(*jroot);
 		*jroot = NULL;
 	} else {
-		if(*jroot == NULL) {
-			/* now we need a root obj */
-			*jroot = json_object_new_object();
-		}
 		leaf = jsonPathGetLeaf(name, ustrlen(name));
 		CHKiRet(jsonPathFindParent(*jroot, name, leaf, &parent, 1));
 		if(jsonVarExtract(parent, (char*)leaf, &leafnode) == FALSE)
@@ -4413,9 +4512,8 @@ msgDelJSON(msg_t * const pM, uchar *name)
 	}
 
 finalize_it:
-	if(name[0] == '/')
-		pthread_rwlock_unlock(&glblVars_rwlock);
-	MsgUnlock(pM);
+	if(mut != NULL)
+		pthread_mutex_unlock(mut);
 	RETiRet;
 }
 
@@ -4600,7 +4698,7 @@ rsRetVal msgQueryInterface(void) { return RS_RET_NOT_IMPLEMENTED; }
  * rgerhards, 2008-01-04
  */
 BEGINObjClassInit(msg, 1, OBJ_IS_CORE_MODULE)
-	pthread_rwlock_init(&glblVars_rwlock, NULL);
+	pthread_mutex_init(&glblVars_lock, NULL);
 
 	/* request objects we use */
 	CHKiRet(objUse(datetime, CORE_COMPONENT));
